@@ -2,7 +2,6 @@
 
 > Tài liệu kỹ thuật chi tiết cho 2 cog: **Hệ thống Menu Trợ Giúp** (`economy.py`) và **Autoresponder / Custom Command Builder** (`autoresponder.py`). Giải thích từng khối code làm gì, cách dùng, và cách ghép 2 file (cũng như ghép các block bên trong autoresponder) lại với nhau.
 >
-
 > 🆕 **Cập nhật mới nhất:** +100 khối (**Nhóm K** — 50 hàm thuần chuỗi/toán học mới + 25 khối kinh tế mở rộng + 25 khối Discord/kiểm duyệt mở rộng) vừa được thêm vào `autoresponder.py`, kèm theo trang trợ giúp mới ở cả 2 file (`!ar help` → Trang 7/7, `!help` → mục Autoresponder Trang 11/11).
 >
 > _Bản trước đó: +110 khối Nhóm J (xem lịch sử cập nhật ở cuối mỗi bảng)._
