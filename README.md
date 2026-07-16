@@ -11,6 +11,8 @@
 1. [Tổng quan](#-tổng-quan)
 2. [Phần 1 — `economy.py`: Hệ thống Menu Trợ Giúp](#-phần-1--economypy-hệ-thống-menu-trợ-giúp)
 3. [Phần 2 — `autoresponder.py`: Autoresponder Engine](#-phần-2--autoresponderpy-autoresponder-engine)
+   - [Cấu trúc xử lý 1 reply — chi tiết từng bước (pipeline)](#cấu-trúc-xử-lý-1-reply--chi-tiết-từng-bước-pipeline)
+   - [Minh hoạ cách hoạt động của một số khối tiêu biểu](#minh-hoạ-cách-hoạt-động-của-một-số-khối-tiêu-biểu)
 4. [Phần 3 — Cách ghép mọi thứ lại với nhau](#-phần-3--cách-ghép-mọi-thứ-lại-với-nhau)
 5. [Giới hạn hệ thống](#️-giới-hạn-hệ-thống)
 
@@ -137,6 +139,164 @@ Autoresponder (commands.Cog)
    ├─ on_message → find_matching_trigger() → engine.run()
    ├─ nhóm lệnh !ar (add/edit/del/list/show/embed/welcome/leave/bridge/rotate)
    └─ UI block: Select Menu / Role Select / Modal Button (no-code)
+```
+
+### Cấu trúc xử lý 1 reply — chi tiết từng bước (pipeline)
+
+Khi 1 tin nhắn khớp trigger, `engine.run()` không "chạy 1 lần từ trái sang phải" — nó xử lý reply qua **6 giai đoạn tuần tự**, mỗi giai đoạn chỉ quan tâm 1 loại khối, giai đoạn sau chỉ nhận input đã được giai đoạn trước xử lý xong:
+
+```
+<reply gốc, còn nguyên mọi {block}>
+        │
+        ▼
+① check_gates()            // quét toàn bộ {require*}/{deny*}/{cooldown}/{only*}
+        │  Có gate nào FALSE?
+        │   ├─ CÓ  → dừng ngay, không chạy tiếp bất kỳ giai đoạn nào,
+        │   │        hiện lỗi (trừ khi có {silent})
+        │   └─ KHÔNG → xoá hết khối gate khỏi text, đi tiếp
+        ▼
+② resolve_loop_blocks()    // tìm {loop:...}{start}...{stop}, lặp & nhân bản nội dung
+        │  Output: text đã "giãn nở" — 1 vòng loop biến thành N đoạn text nối nhau
+        ▼
+③ resolve_str_functions()  // tính mọi {uppercase:} {math:} {ncr:} ... (203 hàm thuần)
+        │  Hàm thuần = không tác động Discord, không cần await DB,
+        │  chỉ nhận chuỗi/số từ tham số & trả ra 1 chuỗi kết quả
+        ▼
+④ resolve_conditionals()   // {ifvar:}/{ifbal:}/{ifrole:}/{ifarg:} → chọn nhánh đúng/sai
+        │  Chỉ giữ lại nhánh thắng, xoá hẳn nhánh thua khỏi text
+        ▼
+⑤ render_text()            // thay nốt placeholder còn sót: {user} [$1] {server_name}...
+        │  Output: text HIỂN THỊ CUỐI CÙNG sẽ gửi lên Discord
+        ▼
+⑥ run_side_effects()       // duyệt lại {block} theo ĐÚNG thứ tự xuất hiện trong reply gốc,
+        │                     thực thi từng cái: addrole, modifybal, kick, banktransfer...
+        ▼
+   gửi tin / embed lên Discord (hoặc DM/kênh khác nếu có {dm}/{sendto:})
+```
+
+**Vì sao chia làm 6 giai đoạn thay vì xử lý 1 lượt?** Vì thứ tự phụ thuộc dữ liệu: `{ifbal:}` (giai đoạn ④) cần biết `{modifybal:}` **chưa** chạy (side effect luôn ở giai đoạn ⑥, sau cùng) để so sánh đúng số dư **trước khi** trigger này thay đổi nó; `{loop:}` (giai đoạn ②) phải chạy trước `resolve_str_functions` để các hàm chuỗi/toán học bên trong `{start}...{stop}` được tính **riêng cho từng vòng lặp** thay vì tính 1 lần rồi lặp lại y hệt.
+
+### Minh hoạ cách hoạt động của một số khối tiêu biểu
+
+#### 1. Khối Gate — `{requirerole:@VIP}`
+
+```
+Input:  {requirerole:@VIP}Chào {user}, khu vực VIP!
+        │
+        ▼
+Bước 1: Parse "@VIP" → tra ra role_id thật trong guild
+Bước 2: Lấy danh sách role hiện có của member vừa gõ trigger
+Bước 3: role_id có nằm trong danh sách đó không?
+        │
+        ├─ CÓ   → xoá {requirerole:@VIP} khỏi text, tiếp tục pipeline
+        │          → render ra: "Chào Tí, khu vực VIP!"
+        │
+        └─ KHÔNG → huỷ toàn bộ reply ngay tại đây (các giai đoạn ②-⑥ KHÔNG chạy)
+                   → nếu không có {silent}: bot trả lời
+                     "❌ Bạn cần role @VIP để dùng lệnh này."
+                   → nếu có {silent}: im lặng hoàn toàn, không gửi gì
+```
+
+#### 2. Khối Side Effect — `{modifybal:+1000}`
+
+```
+Input:  {modifybal:+1000}Bạn vừa nhận 1000 GC!
+        │
+        ▼
+Giai đoạn ⑤ (render_text): khối này KHÔNG bị đổi thành gì ở bước render —
+        nó chỉ được "đánh dấu vị trí" rồi giữ nguyên tới giai đoạn ⑥.
+        Text hiển thị cho user: "Bạn vừa nhận 1000 GC!"
+        │
+        ▼
+Giai đoạn ⑥ (run_side_effects), CHẠY SAU KHI tin nhắn trên đã được gửi:
+Bước 1: Parse toán tử "+" và số "1000"
+Bước 2: Kiểm tra |1000| ≤ MAX_BAL_CHANGE (100,000) → hợp lệ
+Bước 3: await eco_modify_balance(guild_id, user_id, '+', 1000)
+Bước 4: Ghi số dư mới vào bảng ar_balances (hoặc bảng GC thật nếu đã nối Adapter)
+        │
+        ▼
+Nếu có NHIỀU {modifybal:}/{addrole:}/{kick:}... trong 1 reply,
+chúng chạy TUẦN TỰ đúng thứ tự xuất hiện trong text gốc — khối sau
+luôn thấy được kết quả (số dư, role...) mà khối trước vừa đổi.
+```
+
+#### 3. Khối Loop — `{loop:1-3}{start}#[loop]{loopsep:, }{stop}`
+
+```
+Input:  {loop:1-3}{start}#[loop]{loopsep:, }{stop}
+        │
+        ▼
+Bước 1: Parse spec "1-3" → range = [1, 2, 3], total = 3 vòng
+Bước 2: Với mỗi vòng i (i = 1, 2, 3), lấy riêng nội dung giữa {start}...{stop}
+        rồi thay các token: [loop]=i, [loopindex]=i-1,
+        [loopfirst]="true" nếu i==1, [looplast]="true" nếu i==vòng cuối
+Bước 3: Nối kết quả từng vòng lại, chèn {loopsep:, } giữa 2 vòng liên tiếp
+        — riêng vòng CUỐI thì KHÔNG chèn separator phía sau
+
+  Vòng 1 (i=1): "#1"        →  giữ nguyên (vòng đầu, chưa cần separator)
+  Vòng 2 (i=2): "#2"        →  nối thêm ", " phía trước: ", #2"
+  Vòng 3 (i=3): "#3"        →  nối thêm ", " phía trước: ", #3"
+                                  (KHÔNG thêm ", " sau vì là vòng cuối)
+        │
+        ▼
+Output sau giai đoạn ②:  "#1, #2, #3"
+→ Text này mới được đưa tiếp qua giai đoạn ③④⑤ như 1 đoạn text bình thường.
+```
+
+#### 4. Khối Điều kiện (if/else) — `{ifbal:>=|1000|Bạn giàu rồi đó!|Cố kiếm thêm GC nhé.}`
+
+```
+Input:  {ifbal:>=|1000|Bạn giàu rồi đó!|Cố kiếm thêm GC nhé.}
+        │
+        ▼
+Bước 1: Parse toán tử ">=" , mốc so sánh "1000"
+Bước 2: await eco_get_balance(guild_id, user_id)  → giả sử trả về 1500
+Bước 3: So sánh: 1500 >= 1000 ?
+        │
+        ├─ ĐÚNG  → giữ lại nhánh "Bạn giàu rồi đó!", XOÁ hẳn nhánh sai
+        └─ SAI   → giữ lại nhánh "Cố kiếm thêm GC nhé.", XOÁ hẳn nhánh đúng
+        │
+        ▼
+Output:  "Bạn giàu rồi đó!"   (nếu số dư ≥ 1000)
+→ Nhánh bị loại biến mất hoàn toàn khỏi text, không hiện ra dù ẩn hay lộ.
+```
+
+#### 5. Khối Random liên kết — `{choose:A|B|C}` + `{lockedchoose:X|Y|Z}`
+
+```
+Input:  Bạn bốc được lá {choose:A|B|C}! Phần thưởng tương ứng: {lockedchoose:100 GC|500 GC|1000 GC}
+        │
+        ▼
+Bước 1: {choose:A|B|C} bốc ngẫu nhiên 1 index, vd index = 1 (chọn "B")
+        → lưu lại index này làm "khoá dùng chung" cho lượt render hiện tại
+Bước 2: {lockedchoose:100 GC|500 GC|1000 GC} KHÔNG bốc ngẫu nhiên riêng —
+        nó dùng LẠI index = 1 vừa lưu → chọn phần tử thứ 1 → "500 GC"
+        │
+        ▼
+Output: "Bạn bốc được lá B! Phần thưởng tương ứng: 500 GC"
+→ Đây là cách để 1 lá bài ngẫu nhiên luôn đi kèm ĐÚNG phần thưởng của nó,
+  thay vì 2 khối random độc lập có thể lệch nhau (vd bốc "B" nhưng lại
+  hiện thưởng của "A").
+```
+
+#### 6. Khối No-code — `{addselectmenu:Chọn 1 vai trò|Chiến binh/vaichienbinh;Pháp sư/vaiphapsu}`
+
+```
+Input:  {addselectmenu:Chọn 1 vai trò|Chiến binh/vaichienbinh;Pháp sư/vaiphapsu}
+        │
+        ▼
+Bước 1: Parse placeholder "Chọn 1 vai trò" + danh sách "Nhãn/trigger" cách nhau ";"
+Bước 2: Khối này KHÔNG in ra text — nó được chuyển thành 1 discord.ui.Select
+        gắn kèm theo tin nhắn (không nằm trong nội dung message)
+Bước 3: Khi user chọn "Chiến binh" trong dropdown:
+        → bot nhận interaction, tra ra trigger đích = "vaichienbinh"
+        → gọi lại find_matching_trigger("vaichienbinh") rồi engine.run() y hệt
+          như user vừa tự gõ trigger đó
+        │
+        ▼
+Kết quả: bấm dropdown = chạy 1 autoresponder khác, không cần user gõ chữ.
+⚠️ Vì Select Menu không phải persistent view theo custom_id, nếu bot restart
+   thì dropdown trên tin nhắn CŨ sẽ không còn hoạt động (xem mục Giới hạn).
 ```
 
 ### Cài đặt
