@@ -20,11 +20,11 @@ Dù tên file là `economy.py`, cog bên trong (`EconomyCog`, hiển thị tên 
 
 ```
 ┌─────────────────────┐        ┌──────────────────────────┐
-│    economy.py        │        │   autoresponder.py        │
-│  (Cog "Kinh Tế")      │        │   (Cog "Autoresponder")   │
+│    economy.py         │        │   autoresponder.py        │
+│  (Cog "Kinh Tế")      │        │   (Cog "Autoresponder")        │
 │                       │        │                            │
-│  !help /help          │        │  !ar add/edit/del/...     │
-│  !setprefix !sync     │        │  !ar welcome / leave      │
+│  !help /help          │        │  !ar add/edit/del/...            │
+│  !setprefix !sync     │        │  !ar welcome / leave         │
 │  bật/tắt music (chat) │        │  !ar bridge / rotate      │
 │                       │        │  AutoresponderEngine      │
 │  → embed + dropdown   │◄──text─┤  (parse & render {block}) │
