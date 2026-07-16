@@ -1,4 +1,4 @@
-# 🌾 NINO FARM — Tài liệu `economy.py` & `autoresponder.py`
+# ✨️ YUKI – All-in-One Bot — Tài liệu `economy.py` & `autoresponder.py`
 
 > Tài liệu kỹ thuật chi tiết cho 2 cog: **Hệ thống Menu Trợ Giúp** (`economy.py`) và **Autoresponder / Custom Command Builder** (`autoresponder.py`). Giải thích từng khối code làm gì, cách dùng, và cách ghép 2 file (cũng như ghép các block bên trong autoresponder) lại với nhau.
 
