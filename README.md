@@ -796,3 +796,383 @@ Không có xung đột tên file, nhưng nếu host trên Pterodactyl (bot-hosti
 - Loop không hỗ trợ lồng loop trong loop (`{loop:}` bên trong 1 `{start}...{stop}` khác sẽ không được xử lý như loop con).
 - 🆕 Khối kho bạc/vay nợ (Nhóm K) dùng chung bảng `ar_counters`/`ar_bank` sẵn có — **không** tạo bảng SQLite mới, nên không cần thêm bước migrate DB khi cập nhật.
 - 🆕 Các khối hành động hàng loạt (`{massaddrole:}`, `{moveallvc:}`, `{purgebots:}`...) chạy tuần tự từng đối tượng — với server lớn có thể mất vài giây, nên tránh đặt nhiều khối loại này trong cùng 1 reply.
+# 🎙️ YUKI Bot — Trang 12/12: Hệ thống Voice (Nhóm L)
+
+> Tài liệu này **bổ sung Trang 12** vào bộ tài liệu `economy.py` & `autoresponder.py` đã có (11 trang trong `_pages()` + 7 trang `!ar help`). Trang 12 gom toàn bộ **hệ thống Voice** (Nhóm L) trong `autoresponder.py`: treo voice 24/7, join-to-create, voice log, voice XP — kèm sơ đồ kiến trúc minh hoạ và ví dụ ghép block thực chiến.
+>
+> Nguồn code: `autoresponder.py` (dòng ~419–424 hằng số, ~1137–1330 hàm DB, ~5088–5247 vòng lặp nền + listener, ~6042–6284 lệnh `!ar`).
+
+---
+
+## 📑 Mục lục
+
+1. [Tổng quan hệ thống Voice](#1-tổng-quan-hệ-thống-voice)
+2. [Sơ đồ kiến trúc — bot kết nối voice như thế nào](#2-sơ-đồ-kiến-trúc--bot-kết-nối-voice-như-thế-nào)
+3. [Bảng đầy đủ lệnh quản lý `!ar`](#3-bảng-đầy-đủ-lệnh-quản-lý-ar)
+4. [Bảng đầy đủ block dùng trong reply](#4-bảng-đầy-đủ-block-dùng-trong-reply)
+5. [Sơ đồ luồng xử lý từng tính năng con](#5-sơ-đồ-luồng-xử-lý-từng-tính-năng-con)
+6. [Ví dụ ghép block thực chiến](#6-ví-dụ-ghép-block-thực-chiến)
+7. [Giới hạn & lưu ý vận hành](#7-giới-hạn--lưu-ý-vận-hành)
+
+---
+
+## 1. Tổng quan hệ thống Voice
+
+Nhóm L gồm **4 tính năng con**, tất cả sống trong cùng 1 cog (`Autoresponder`), chia sẻ chung 1 listener Discord (`on_voice_state_update`) và 3 bảng SQLite riêng (`ar_voice_hold`, `ar_voice_jtc` + `ar_voice_jtc_temp`, `ar_voice_xp`):
+
+| Tính năng | Mục đích | Lệnh gốc | Chạy nền? |
+|---|---|---|---|
+| 🎙️ **Voice Hold** (treo voice 24/7) | Bot tự vào và **giữ chỗ** 1 kênh voice mãi mãi, tự nối lại nếu bị rớt/bị kick, có thể kèm phát nhạc lặp vô hạn | `!ar voicehold` | ✅ vòng lặp `_voice_hold_loop` (tick mỗi 25s) |
+| 🔊 **Join-to-Create (JTC)** | Vào 1 kênh "mẫu" → bot tự tạo 1 kênh voice riêng, move người đó vào, tự xoá khi trống | `!ar jtc` | ❌ chỉ phản ứng theo sự kiện `on_voice_state_update` |
+| 📋 **Voice Log (vlog)** | Gửi tin nhắn thông báo khi ai đó vào/rời 1 kênh voice bất kỳ, dùng chung engine với `!ar welcome/leave` | `!ar vlog` | ❌ chỉ phản ứng theo sự kiện |
+| 📈 **Voice XP** | Cộng điểm theo tổng thời gian ở trong voice, tách biệt hoàn toàn khỏi GC/economy | `!ar voicexp` | ❌ tích luỹ lúc user rời/đổi kênh |
+
+Cả 4 đều **không** đụng tới `economy.py` — không import, không chia sẻ bảng dữ liệu. Voice XP cũng **tách biệt** khỏi hệ GC thật/`ar_balances` (khác nhóm kinh tế K).
+
+---
+
+## 2. Sơ đồ kiến trúc — bot kết nối voice như thế nào
+
+### 2.1 Tổng quan tầng kết nối
+
+```
+┌───────────────────────────────────────────────────────────────────────┐
+│                         Discord Voice Gateway                          │
+│              (kênh voice thật, âm thanh UDP, danh sách member)         │
+└───────────────────────────────────────────────────────────────────────┘
+        ▲                          ▲                            ▲
+        │ connect()/move_to()      │ member.move_to()           │ sự kiện
+        │ (chiếm 1 "ghế" bot)      │ (ép member đổi/rời kênh)   │ vào/rời/đổi kênh
+        │                          │                             │
+┌───────┴──────────────┐  ┌────────┴───────────┐   ┌─────────────┴─────────────┐
+│  discord.VoiceClient   │  │  guild.create_voice_ │   │ on_voice_state_update()   │
+│  (giữ bởi guild.voice_ │  │  channel() + set_    │   │  listener DUY NHẤT xử lý  │
+│  client — CHỈ 1/server)│  │  permissions()        │   │  cả 3 nhánh bên dưới      │
+└───────┬───────────────┘  └────────┬────────────┘   └─────┬──────────┬──────────┘
+        │                            │                       │          │
+        ▼                            ▼                       ▼          ▼
+┌───────────────┐         ┌───────────────────┐   ┌──────────────┐ ┌──────────────┐
+│ 🎙️ Voice Hold  │         │ 🔊 Join-to-Create   │   │ 📋 Voice Log  │ │ 📈 Voice XP   │
+│ _voice_hold_   │         │ _handle_jtc_join()  │   │ _run_voice_   │ │ _handle_voice │
+│ loop() (nền,   │         │ _handle_jtc_maybe_  │   │ event()       │ │ _xp() (tích   │
+│ tick 25s, tự   │         │ delete() (8s sau    │   │ (gửi tin theo │ │ giây khi rời  │
+│ nối lại)       │         │ khi kênh trống)      │   │ !ar vlog)     │ │ kênh)         │
+└───────┬───────┘         └──────────┬──────────┘   └──────────────┘ └──────┬───────┘
+        │                            │                                       │
+        ▼                            ▼                                       ▼
+  ar_voice_hold                ar_voice_jtc /                          ar_voice_xp
+  (1 dòng/server)            ar_voice_jtc_temp                    (xp, seconds_total)
+                            (rule mẫu / kênh tạm đang sống)
+```
+
+**Điểm mấu chốt:** Discord chỉ cho **1 bot chiếm 1 "ghế" voice / server** (`guild.voice_client`). Vì vậy **Voice Hold** là tính năng duy nhất thực sự khiến *bot* ngồi trong kênh voice — 3 tính năng còn lại (JTC, vlog, voice XP) **không** cần bot vào voice, chúng chỉ lắng nghe sự kiện `on_voice_state_update` do Discord gửi mỗi khi *member* (không phải bot) vào/rời/đổi kênh.
+
+### 2.2 Vòng lặp giữ kết nối của Voice Hold
+
+```
+      bot khởi động → cog_load() → asyncio.create_task(_voice_hold_loop())
+                                          │
+                    ┌─────────────────────┘
+                    ▼
+        while True:  (chạy mãi, không dừng)
+        │
+        ├─► lấy danh sách server đang bật voicehold (ar_voice_hold, enabled=1)
+        │
+        ├─► với mỗi server:
+        │     │
+        │     ├─ guild.voice_client đang kết nối?
+        │     │    ├─ CÓ, đúng kênh mục tiêu      → không làm gì (đã ổn)
+        │     │    ├─ CÓ, SAI kênh (bị move lộn)  → vc.move_to(kênh_mục_tiêu)
+        │     │    └─ KHÔNG (bị rớt / bị kick /    → channel.connect(reconnect=True)
+        │     │       chưa từng vào)                  ← đây là bước "tự nối lại"
+        │     │
+        │     └─ nếu có cấu hình phát nhạc (play_audio=1) và chưa đang phát:
+        │            → _play_hold_audio(vc, audio_query)
+        │                 │
+        │                 └─► FFmpegPCMAudio(query) → vc.play(source, after=callback)
+        │                       callback: nếu vc còn kết nối → GỌI LẠI CHÍNH NÓ
+        │                       ⇒ lặp vô hạn, không cần cron/task riêng
+        │
+        └─► sleep(25 giây) rồi lặp lại từ đầu
+```
+
+`!ar voicehold off` đặt server vào tập `_voice_manual_off` (bộ nhớ tạm, mất khi bot restart) — vòng lặp trên sẽ **bỏ qua** server đó ở mỗi tick, tránh trường hợp bot tự nối lại ngay sau khi admin chủ động tắt.
+
+### 2.3 Luồng Join-to-Create (JTC)
+
+```
+Member bấm vào kênh "🔊 Tạo Phòng" (kênh mẫu đã đăng ký bằng !ar jtc add)
+        │
+        ▼
+on_voice_state_update(before=None/khác kênh, after=kênh_mẫu)
+        │
+        ▼
+_handle_jtc_join(member, kênh_mẫu)
+        │
+        ├─ tra ar_voice_jtc theo (guild_id, source_channel_id) → có rule không?
+        │      KHÔNG → dừng, không làm gì
+        │      CÓ    → tiếp tục
+        │
+        ├─ guild.create_voice_channel(tên đã thay {user}/{user_name}, category, user_limit)
+        ├─ set_permissions(member, manage_channels=True, move_members=True)  ← member = "chủ phòng"
+        ├─ ghi vào ar_voice_jtc_temp (channel_id → guild_id, jtc_id, owner_id)
+        └─ member.move_to(kênh_mới)   ← tự động đẩy member từ kênh mẫu sang phòng riêng
+
+... (member chơi/nói chuyện trong phòng riêng) ...
+
+Member rời phòng riêng (hoặc rời hẳn voice)
+        │
+        ▼
+on_voice_state_update(before=phòng_riêng, after=khác/None)
+        │
+        ▼
+_handle_jtc_maybe_delete(phòng_riêng)
+        │
+        ├─ có trong ar_voice_jtc_temp không? KHÔNG → bỏ qua (không phải kênh JTC tạo ra)
+        ├─ CÓ → hẹn giờ 8 giây (JTC_EMPTY_DELETE_DELAY), HUỶ hẹn giờ cũ nếu có
+        │        (tránh xoá nhầm khi member chỉ đang "nhảy" tạm qua kênh khác rồi quay lại)
+        │
+        └─ sau 8 giây: kiểm tra lại — kênh vẫn TỒN TẠI và TRỐNG (0 member)?
+               CÓ  → channel.delete() + xoá record khỏi ar_voice_jtc_temp
+               KHÔNG (đã có người khác vào) → không xoá, giữ nguyên
+```
+
+### 2.4 Voice Log + Voice XP — cùng chạy trên 1 sự kiện
+
+```
+on_voice_state_update(member, before, after)
+        │
+        ├─ bỏ qua ngay nếu member.bot == True (không log/không cộng XP cho bot khác)
+        │
+        ├─ joined_channel = after.channel tồn tại VÀ khác before.channel
+        ├─ left_channel   = before.channel tồn tại VÀ khác after.channel
+        │   (đổi kênh A→B: joined_channel=True VÀ left_channel=True CÙNG LÚC)
+        │
+        ▼
+① _handle_voice_xp(member, joined, left)   ← LUÔN chạy trước, không phụ thuộc vlog/jtc
+        │  joined → lưu mốc thời gian bắt đầu (bộ nhớ RAM, self._voice_join_ts)
+        │  left   → lấy lại mốc đã lưu, tính elapsed = now - mốc
+        │           elapsed ≥ 20 giây (VOICE_XP_MIN_SECONDS)?
+        │             CÓ  → voice_xp_add_seconds() → +2 XP/phút, ghi vào ar_voice_xp
+        │             KHÔNG (vào rồi ra ngay, chống spam) → bỏ qua, không cộng
+        ▼
+② _run_voice_event(member, "vjoin"/"vleave", channel)   ← nếu !ar vlog đang bật
+        │  dựng 1 "tin nhắn giả" (_FakeMessage) đại diện cho member trong kênh log
+        │  → chạy LẠI TOÀN BỘ pipeline 6 giai đoạn của engine.run() như 1 autoresponder
+        │    bình thường, chỉ khác: {voice_channel}/{voice_channel_name}/{voice_channel_id}
+        │    được "bơm sẵn" (_voice_channel_override) trỏ đúng kênh voice vừa vào/rời
+        ▼
+③ _handle_jtc_join() / _handle_jtc_maybe_delete()   ← nếu kênh liên quan là kênh mẫu/kênh tạm JTC
+```
+
+---
+
+## 3. Bảng đầy đủ lệnh quản lý `!ar`
+
+Tất cả lệnh nhóm Voice yêu cầu quyền **Manage Server** (`is_owner_or_manage_guild()`), trừ `!ar voicexp show/top` — ai cũng xem được, chỉ riêng `!ar voicexp reset` mới cần quyền admin.
+
+### 3.1 `!ar voicehold` — treo voice 24/7
+
+| Lệnh | Tham số | Tác dụng |
+|---|---|---|
+| `!ar voicehold` | — | Hiện hướng dẫn nhanh 4 lệnh con bên dưới |
+| `!ar voicehold set <#voice> [#kênh_log]` | `#voice` bắt buộc, `#kênh_log` tuỳ chọn | Treo voice **không** kèm nhạc — bot chỉ vào và giữ chỗ, tự nối lại nếu rớt/bị kick |
+| `!ar voicehold music <#voice> <link/stream>` | `#voice` + URL stream trực tiếp | Treo voice **kèm nhạc** lặp vô hạn (cần ffmpeg trên host; không tự tìm Youtube) |
+| `!ar voicehold off` | — | Tắt cấu hình + rời kênh ngay lập tức |
+| `!ar voicehold show` | — | Xem kênh đang treo, trạng thái bật/tắt, có kèm nhạc hay không |
+
+### 3.2 `!ar jtc` — join-to-create
+
+| Lệnh | Tham số | Tác dụng |
+|---|---|---|
+| `!ar jtc` | — | Hiện hướng dẫn nhanh |
+| `!ar jtc add <#kênh_mẫu> [#category] [tên_mẫu] [giới_hạn]` | kênh mẫu bắt buộc; `tên_mẫu` hỗ trợ `{user}`/`{user_name}`; `giới_hạn` là số (0 = không giới hạn) | Đăng ký 1 kênh làm "kênh mẫu" — ai vào sẽ được tự tạo phòng riêng |
+| `!ar jtc remove <#kênh_mẫu>` | — | Gỡ rule của kênh mẫu đó |
+| `!ar jtc list` | — | Xem toàn bộ rule JTC đang có của server |
+
+### 3.3 `!ar vlog` — voice log
+
+| Lệnh | Tác dụng |
+|---|---|
+| `!ar vlog` | Hiện hướng dẫn nhanh |
+| `!ar vlog join channel <#kênh>` | Đặt kênh nhận log khi có người **vào** voice |
+| `!ar vlog join setreply <reply>` | Đặt nội dung tin nhắn log (dùng chung cú pháp block với `!ar add`) |
+| `!ar vlog join toggle` | Bật/tắt log vào voice |
+| `!ar vlog join show` | Xem cấu hình hiện tại |
+| `!ar vlog join test` | Gửi thử 1 tin log mẫu |
+| `!ar vlog leave channel/setreply/toggle/show/test` | Y hệt nhóm `join` nhưng cho sự kiện **rời** voice |
+
+### 3.4 `!ar voicexp` — điểm kinh nghiệm voice
+
+| Lệnh | Quyền cần | Tác dụng |
+|---|---|---|
+| `!ar voicexp` (hoặc `!ar voicexp show`) | Ai cũng dùng được | Xem XP/cấp/hạng/tổng phút voice của **chính mình** |
+| `!ar voicexp show <@user>` | Ai cũng dùng được | Xem của người khác |
+| `!ar voicexp top` | Ai cũng dùng được | Bảng xếp hạng top 10 voice XP server |
+| `!ar voicexp reset <@user>` | Manage Server | Xoá sạch voice XP của 1 người |
+
+---
+
+## 4. Bảng đầy đủ block dùng trong reply
+
+Dùng được trong `<reply>` của bất kỳ `!ar add`/`!ar editreply`/`!ar welcome`/`!ar leave`/`!ar vlog ... setreply` nào — không riêng gì trigger voice.
+
+### 4.1 Side Effects (hiệu ứng phụ — chạy ở giai đoạn ⑥ run_side_effects)
+
+| Block | Tham số | Tác dụng | Quyền người gõ trigger cần |
+|---|---|---|---|
+| `{holdvoice:#kênh}` | tên/ID/mention kênh voice | Bật treo voice 24/7 ở kênh này (không kèm nhạc) — tương đương `!ar voicehold set` nhưng gọi được từ trong 1 reply | `manage_guild` |
+| `{unholdvoice}` | — | Tắt treo voice 24/7 của server | `manage_guild` |
+| `{jtcadd:#kênh_mẫu\|#category\|tên_mẫu\|giới_hạn}` | 4 phần, chỉ phần 1 bắt buộc | Đăng ký kênh mẫu JTC ngay trong reply | `manage_channels` |
+| `{jtcremove:#kênh_mẫu}` | — | Gỡ rule JTC của kênh đó | `manage_channels` |
+| `{lockvc:#kênh}` | — | Khoá kênh voice — chặn quyền **Connect** của `@everyone` | bot cần `manage_channels` |
+| `{unlockvc:#kênh}` | — | Mở khoá lại (trả quyền Connect về mặc định) | bot cần `manage_channels` |
+| `{vclimit:#kênh\|số}` | số 0–99 | Đổi giới hạn số người của 1 kênh voice | bot cần `manage_channels` |
+| `{renamevc:#kênh\|tên mới}` | tên mới hỗ trợ placeholder (`{user}`...) | Đổi tên kênh voice | bot cần `manage_channels` |
+| `{bitratevc:#kênh\|kbps}` | số kbps, tự giới hạn theo mức trần boost server | Đổi chất lượng âm thanh (bitrate) kênh voice | bot cần `manage_channels` |
+| `{kickallvc:#kênh}` | — | Đá **toàn bộ** thành viên ra khỏi 1 kênh voice (vẫn ở server, không kick khỏi server) — tối đa 50 người/lần | bot cần `move_members` |
+| `{addvoicexp:+100\|@user}` / `{addvoicexp:-50\|@user}` | số ± + user tuỳ chọn (mặc định chính mình) | Cộng/trừ tay điểm voice XP | `manage_guild` |
+| `{resetvoicexp:@user}` | user tuỳ chọn | Xoá sạch voice XP của 1 người | `manage_guild` |
+
+So sánh dễ nhầm: `{kickallvc:#kênh}` (đá **mọi người**, chỉ 1 kênh) ≠ `{disconnectvc:@user}` (đá **1 người**, mọi kênh) ≠ `{moveallvc:#nguồn\|#đích}` (chuyển **mọi người sang kênh khác**, không rời voice hẳn).
+
+### 4.2 Placeholder (chỉ hiển thị — đọc dữ liệu qua `prefetch_voice()`)
+
+| Placeholder | Giá trị trả về |
+|---|---|
+| `{voice_channel}` | Mention kênh voice liên quan (kênh user đang ở, hoặc kênh vừa vào/rời nếu chạy từ `!ar vlog`) |
+| `{voice_channel_name}` | Tên kênh voice đó (text thường, không mention) |
+| `{voice_channel_id}` | ID kênh voice đó |
+| `{voice_xp}` | Điểm voice XP hiện tại của user gõ trigger |
+| `{voice_level}` | Cấp voice tính từ `{voice_xp}` |
+| `{voice_rank}` | Thứ hạng voice XP của user trong server |
+| `{voice_minutes}` | Tổng số phút đã ở trong voice (cộng dồn) |
+| `{voicexpleaderboardtext:N}` | Text bảng xếp hạng top N voice XP, dùng thẳng trong `{embed}` |
+| `{user_voicechannel}` | *(đã có sẵn từ trước Nhóm L)* tên kênh voice user hiện đang ở, khác `{voice_channel}` ở chỗ không ưu tiên override từ `!ar vlog` |
+
+> ⚠️ `{voice_channel}` và 2 biến liên quan dùng **`_voice_channel_override`** khi trigger chạy từ `!ar vlog` (vì lúc render, `member.voice.channel` "sống" có thể đã đổi hoặc về `None` — bot phải nhớ lại đúng kênh tại **thời điểm** sự kiện xảy ra, không phải thời điểm render).
+
+---
+
+## 5. Sơ đồ luồng xử lý từng tính năng con
+
+### 5.1 Voice XP — quy đổi thời gian → điểm
+
+```
+member vào voice lúc 20:00:00 ──► self._voice_join_ts[(guild,user)] = 20:00:00 (RAM, mất khi bot restart)
+        │
+        │   ... member ngồi voice 12 phút 30 giây ...
+        │
+member rời voice lúc 20:12:30 ──► elapsed = 750 giây
+                                          │
+                                   750 ≥ 20 giây (ngưỡng chống spam)?  → CÓ
+                                          │
+                                   xp_gain = int(750 / 60 * 2) = 25 XP
+                                          │
+                                   ghi/cộng dồn vào ar_voice_xp (guild_id, user_id)
+                                          │
+                                   voice_level_from_xp(xp) → cấp tăng CHẬM DẦN theo XP
+                                   (không tuyến tính — càng lên cấp cao càng cần nhiều XP hơn)
+```
+
+Nếu member **vào rồi ra ngay** (< 20 giây) — ví dụ bấm nhầm kênh — `elapsed < VOICE_XP_MIN_SECONDS` nên **không cộng gì cả**, tránh bị spam XP bằng cách vào/ra liên tục.
+
+### 5.2 Vòng đời 1 kênh Join-to-Create
+
+```
+   ①               ②                  ③                    ④
+[Kênh mẫu]  ──►  [Bot tạo    ]  ──►  [Member sinh   ]  ──►  [Kênh tự    ]
+ cố định,         phòng mới,          hoạt trong đó,         xoá khi
+ luôn tồn tại     đặt tên theo        có toàn quyền          trống > 8s
+ (do admin tạo)   template,           quản lý phòng          (trừ khi có
+                  set quyền           (manage_channels,       người quay
+                  chủ phòng           move_members)           lại kịp)
+```
+
+Trạng thái "kênh tạm" chỉ tồn tại trong bảng `ar_voice_jtc_temp` — đây là cách bot phân biệt "kênh JTC vừa tạo, an toàn để tự xoá" với "kênh voice thường do admin tạo tay, không được tự ý xoá dù nó trống".
+
+### 5.3 Vì sao Voice Hold "không bao giờ tắt tiếng" (self-heal loop)
+
+```
+        Trạng thái mong muốn: bot LUÔN ở trong #voice-247
+                    │
+        Có 3 cách trạng thái này bị phá vỡ:
+        │
+        ├─ (a) Ai đó kick bot khỏi voice          ┐
+        ├─ (b) Mất kết nối mạng tạm thời           ├─► TẤT CẢ đều được
+        └─ (c) Bot restart (deploy lại/crash)      ┘    phát hiện ở tick
+                                                          KẾ TIẾP (≤25s sau)
+                    │
+        _voice_hold_loop() không cần biết NGUYÊN NHÂN là gì —
+        nó chỉ hỏi 1 câu duy nhất mỗi 25 giây:
+        "guild.voice_client có đang kết nối ĐÚNG kênh mục tiêu không?"
+                    │
+        KHÔNG → gọi channel.connect(reconnect=True) hoặc vc.move_to()
+                → tự động khôi phục, không cần admin can thiệp
+```
+
+---
+
+## 6. Ví dụ ghép block thực chiến
+
+### 6.1 Treo voice nhạc lofi 24/7 (không cần gõ block, chỉ cần lệnh quản lý)
+
+```
+!ar voicehold music #nhạc-nền https://stream.example.com/lofi.mp3
+```
+→ Bot vào `#nhạc-nền`, phát nhạc lặp vô hạn, tự nối lại nếu bị rớt mạng hay bị kick — không cần thêm bất kỳ autoresponder nào.
+
+### 6.2 Phòng game tự tạo, có nút "khoá phòng" cho chủ phòng
+
+Kết hợp `!ar jtc add` (tạo phòng riêng tự động) với 1 autoresponder dùng `{lockvc:}`/`{vclimit:}`/`{renamevc:}` để chủ phòng tự tuỳ biến phòng mình mà không cần quyền admin thật:
+
+```
+!ar jtc add #tạo-phòng-game NULL "Phòng của {user}" 5
+
+!ar add khoaphong {requirevoice}{lockvc:{user_voicechannel}}{embed}🔒 Đã khoá phòng {voice_channel}, không ai vào thêm được nữa.
+
+!ar add doiten {requirevoice}{requirearg:1}{renamevc:{user_voicechannel}|[$1]}{embed}✅ Đã đổi tên phòng thành **[$1]**.
+
+!ar add gioihan {requirevoice}{requirearg:1|number}{vclimit:{user_voicechannel}|[$1]}{embed}✅ Giới hạn phòng còn tối đa [$1] người.
+```
+Luồng chạy: member vào `#tạo-phòng-game` → bot tự tạo "Phòng của Tí" (tối đa 5 người) và move vào → member gõ `khoaphong`/`doiten Squad Rank/gioihan 3` ngay trong phòng đó để tự quản lý phòng mình.
+
+### 6.3 Dọn phòng + trao thưởng voice XP khi kết thúc sự kiện
+
+Ghép `{kickallvc:}` (đẩy mọi người ra để đóng sự kiện) với placeholder voice XP để thông báo ai chăm voice nhất:
+
+```
+!ar add ketthucsukien {requireperm:move_members}{embed}📢 Sự kiện voice đã kết thúc!{newline}Top người tích cực nhất mùa này:{newline}{voicexpleaderboardtext:5}{kickallvc:#voice-sukien}
+```
+→ Gửi bảng xếp hạng voice XP top 5 **trước**, rồi mới đẩy mọi người ra khỏi `#voice-sukien` (side effect luôn chạy ở giai đoạn cuối, sau khi tin nhắn đã hiển thị).
+
+### 6.4 Voice log kèm thông tin XP ngay khi rời phòng
+
+```
+!ar vlog leave channel #log-voice
+!ar vlog leave setreply {user} vừa rời {voice_channel} · đã tích luỹ {voice_minutes} phút voice (cấp {voice_level}, hạng #{voice_rank}).
+```
+→ Mỗi lần ai rời 1 kênh voice bất kỳ, `#log-voice` nhận 1 dòng vừa báo **rời kênh nào** vừa cho biết luôn **tiến độ voice XP** hiện tại của người đó — không cần gõ thêm lệnh `!ar voicexp show`.
+
+---
+
+## 7. Giới hạn & lưu ý vận hành
+
+| Giới hạn | Giá trị | Hằng số |
+|---|---|---|
+| Chu kỳ tick tự nối lại Voice Hold | 25 giây | `VOICE_HOLD_TICK_SECONDS` |
+| XP cộng mỗi phút ở voice | 2 XP/phút | `VOICE_XP_PER_MINUTE` |
+| Ngưỡng thời gian tối thiểu để tính XP | 20 giây (chống spam vào/ra) | `VOICE_XP_MIN_SECONDS` |
+| Rule join-to-create / server | tối đa 10 | `MAX_JTC_PER_GUILD` |
+| Thời gian chờ trước khi xoá kênh JTC trống | 8 giây | `JTC_EMPTY_DELETE_DELAY` |
+| `{kickallvc:}` / `{moveallvc:}` | tối đa 50 thành viên/lần gọi | (giống giới hạn mass* của Nhóm K) |
+| Giới hạn người / kênh voice qua `{vclimit:}` | 0–99 | theo giới hạn Discord |
+| Bitrate qua `{bitratevc:}` | 8 kbps → trần bitrate thật của server (tuỳ mức boost) | tự động kẹp giá trị |
+
+**Lưu ý kiến trúc quan trọng:**
+- Bot chỉ giữ **1 voice client / server** — không thể vừa treo voice 24/7 ở kênh A vừa dùng `music.py` phát nhạc theo yêu cầu ở kênh B cùng lúc; 2 hệ thống sẽ tranh nhau `guild.voice_client`.
+- `_voice_manual_off` là **bộ nhớ RAM tạm thời** — nếu bot restart ngay sau khi admin gõ `!ar voicehold off`, và cấu hình `enabled` trong DB lỡ chưa kịp cập nhật, vòng lặp nền có thể tự nối lại; nên đây là lý do lệnh `off` luôn ghi thẳng `enabled=0` vào SQLite trước, không chỉ dựa vào tập RAM.
+- Voice XP dùng `asyncio.get_event_loop().time()` (đồng hồ nội bộ tiến trình) để đo `elapsed`, **không** dùng timestamp thật — nghĩa là nếu bot bị treo/sleep tạm thời (không tắt hẳn) rồi chạy tiếp, số phút tính có thể lệch nhẹ so với đồng hồ thực tế.
+- Voice Log (`!ar vlog`) và Voice XP đều chạy trên **cùng 1 sự kiện** `on_voice_state_update` nhưng **độc lập nhau** — tắt `!ar vlog` không ảnh hưởng việc tích điểm Voice XP, và ngược lại.
+- `{holdvoice:}`/`{unholdvoice:}` gọi được từ **bất kỳ trigger nào** (không chỉ lệnh `!ar voicehold`), nên nên đặt kèm `{requireperm:manage_guild}` hoặc `{silent}` để tránh member thường vô tình kích hoạt treo voice ở kênh không mong muốn.
+
